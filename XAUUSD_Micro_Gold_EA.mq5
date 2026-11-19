@@ -1,1 +1,326 @@
-//+------------------------------------------------------------------+\n//|                                      XAUUSD_Micro_Gold_EA.mq5    |\n//|                        Fixed $ Risk + Breakeven + Trailing       |\n//|                        Designed for Deriv XAUUSDmicro            |\n//+------------------------------------------------------------------+\n#property copyright "Dave-4u / Gold Micro EA"\n#property link      "https://github.com/Dave-4u/XAUUSD-Micro-Gold-EA-Deriv-v1"\n#property version   "1.00"\n#property strict\n\n#include <Trade\\Trade.mqh>\nCTrade trade;\n\n//--- INPUTS\ninput group "=== Risk Management ==="\ninput double   RiskAmount          = 1.50;    // Dollars to risk per trade ($1 - $2)\ninput int      MagicNumber         = 20261119;// Magic Number\n\ninput group "=== Symbol ==="\ninput string   SymbolOverride      = "XAUUSDmicro"; // Leave as XAUUSDmicro or change to XAUUSD later\n\ninput group "=== Stop & Trailing ==="\ninput int      ATR_Period          = 14;      // ATR Period\ninput double   ATR_Multiplier      = 1.8;     // Initial Stop = ATR * this\ninput double   Breakeven_RR        = 1.0;     // Move to Breakeven at this R multiple\ninput double   Trail_ATR_Mult      = 1.5;     // Trailing Stop = ATR * this\ninput int      Trail_Start_RR      = 1;       // Start trailing after this R (usually same as BE)\n\ninput group "=== Strategy Filters ==="\ninput int      EMA_Fast            = 21;      // Fast EMA (H4 bias)\ninput int      EMA_Slow            = 50;      // Slow EMA (H4 bias)\ninput int      Max_Spread_Points   = 50;      // Max allowed spread (points)\n\n//--- Global\nstring         TradeSymbol;\ndouble         PointValue;\nint            DigitsValue;\n\n//+------------------------------------------------------------------+\n//| Expert initialization function                                   |\n//+------------------------------------------------------------------+\nint OnInit()\n{\n   TradeSymbol = (SymbolOverride == "") ? _Symbol : SymbolOverride;\n   \n   if(!SymbolSelect(TradeSymbol, true))\n   {\n      Print("ERROR: Symbol ", TradeSymbol, " not found. Check market watch.");\n      return(INIT_FAILED);\n   }\n   \n   PointValue  = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);\n   DigitsValue = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_DIGITS);\n   \n   trade.SetExpertMagicNumber(MagicNumber);\n   trade.SetDeviationInPoints(20);\n   trade.SetTypeFilling(ORDER_FILLING_IOC);\n   \n   Print("XAUUSD Micro Gold EA initialized on ", TradeSymbol, " | Risk: $", RiskAmount);\n   return(INIT_SUCCEEDED);\n}\n\n//+------------------------------------------------------------------+\n//| Expert deinitialization function                                 |\n//+------------------------------------------------------------------+\nvoid OnDeinit(const int reason)\n{\n   Print("EA removed. Reason: ", reason);\n}\n\n//+------------------------------------------------------------------+\n//| Expert tick function                                             |\n//+------------------------------------------------------------------+\nvoid OnTick()\n{\n   //--- Manage existing position first (BE + Trailing)\n   ManageOpenPosition();\n   \n   //--- Only one position at a time\n   if(PositionSelectByMagic(TradeSymbol, MagicNumber))\n      return;\n   \n   //--- Check spread\n   double spread = SymbolInfoInteger(TradeSymbol, SYMBOL_SPREAD) * PointValue;\n   if(spread > Max_Spread_Points * PointValue)\n      return;\n   \n   //--- Get trend bias from H4\n   int trend = GetH4Trend();\n   if(trend == 0) return;   // No clear trend\n   \n   //--- Look for entry\n   if(trend == 1)\n      CheckBuyEntry();\n   else if(trend == -1)\n      CheckSellEntry();\n}\n\n//+------------------------------------------------------------------+\n//| H4 Trend Filter (EMA Fast vs Slow)                               |\n//+------------------------------------------------------------------+\nint GetH4Trend()\n{\n   double emaFast[], emaSlow[];\n   ArraySetAsSeries(emaFast, true);\n   ArraySetAsSeries(emaSlow, true);\n   \n   int h4 = iEMA(TradeSymbol, PERIOD_H4, EMA_Fast, PRICE_CLOSE);\n   int h4s = iEMA(TradeSymbol, PERIOD_H4, EMA_Slow, PRICE_CLOSE);\n   \n   if(CopyBuffer(h4, 0, 0, 3, emaFast) < 3) return 0;\n   if(CopyBuffer(h4s, 0, 0, 3, emaSlow) < 3) return 0;\n   \n   if(emaFast[0] > emaSlow[0] && emaFast[1] > emaSlow[1])\n      return 1;   // Bullish\n   if(emaFast[0] < emaSlow[0] && emaFast[1] < emaSlow[1])\n      return -1;  // Bearish\n   \n   return 0;\n}\n\n//+------------------------------------------------------------------+\n//| Calculate Lot Size based on fixed dollar risk                    |\n//+------------------------------------------------------------------+\ndouble CalculateLotSize(double stopDistancePrice)\n{\n   if(stopDistancePrice <= 0) return 0.0;\n   \n   double tickValue = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_VALUE);\n   double tickSize  = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_SIZE);\n   double minLot    = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MIN);\n   double maxLot    = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MAX);\n   double lotStep   = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_STEP);\n   \n   if(tickValue == 0 || tickSize == 0) return 0.0;\n   \n   // Money risked per 1.0 lot for this stop distance\n   double moneyPerLot = (stopDistancePrice / tickSize) * tickValue;\n   \n   if(moneyPerLot <= 0) return 0.0;\n   \n   double lots = RiskAmount / moneyPerLot;\n   \n   // Normalize to lot step\n   lots = MathFloor(lots / lotStep) * lotStep;\n   \n   if(lots < minLot) lots = minLot;\n   if(lots > maxLot) lots = maxLot;\n   \n   return NormalizeDouble(lots, 2);\n}\n\n//+------------------------------------------------------------------+\n//| Buy Entry Logic                                                  |\n//+------------------------------------------------------------------+\nvoid CheckBuyEntry()\n{\n   // Simple pullback + momentum filter on current timeframe\n   double atr = GetATR();\n   if(atr <= 0) return;\n   \n   double ask = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);\n   double stopLoss = ask - (atr * ATR_Multiplier);\n   double stopDistance = ask - stopLoss;\n   \n   double lots = CalculateLotSize(stopDistance);\n   if(lots <= 0) return;\n   \n   // Basic confirmation: price above fast EMA on current TF\n   double ema[];\n   ArraySetAsSeries(ema, true);\n   int handle = iEMA(TradeSymbol, PERIOD_CURRENT, 21, PRICE_CLOSE);\n   if(CopyBuffer(handle, 0, 0, 2, ema) < 2) return;\n   \n   if(ask > ema[0])\n   {\n      double takeProfit = 0; // We manage with trailing, no fixed TP\n      \n      if(trade.Buy(lots, TradeSymbol, ask, stopLoss, takeProfit, "Gold Micro Buy"))\n      {\n         Print("BUY opened | Lots: ", lots, " | SL: ", stopLoss, " | Risk: $", RiskAmount);\n      }\n   }\n}\n\n//+------------------------------------------------------------------+\n//| Sell Entry Logic                                                 |\n//+------------------------------------------------------------------+\nvoid CheckSellEntry()\n{\n   double atr = GetATR();\n   if(atr <= 0) return;\n   \n   double bid = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);\n   double stopLoss = bid + (atr * ATR_Multiplier);\n   double stopDistance = stopLoss - bid;\n   \n   double lots = CalculateLotSize(stopDistance);\n   if(lots <= 0) return;\n   \n   double ema[];\n   ArraySetAsSeries(ema, true);\n   int handle = iEMA(TradeSymbol, PERIOD_CURRENT, 21, PRICE_CLOSE);\n   if(CopyBuffer(handle, 0, 0, 2, ema) < 2) return;\n   \n   if(bid < ema[0])\n   {\n      double takeProfit = 0;\n      \n      if(trade.Sell(lots, TradeSymbol, bid, stopLoss, takeProfit, "Gold Micro Sell"))\n      {\n         Print("SELL opened | Lots: ", lots, " | SL: ", stopLoss, " | Risk: $", RiskAmount);\n      }\n   }\n}\n\n//+------------------------------------------------------------------+\n//| Manage Open Position - Breakeven + Trailing                      |\n//+------------------------------------------------------------------+\nvoid ManageOpenPosition()\n{\n   if(!PositionSelectByMagic(TradeSymbol, MagicNumber))\n      return;\n   \n   double openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);\n   double currentSL  = PositionGetDouble(POSITION_SL);\n   double volume     = PositionGetDouble(POSITION_VOLUME);\n   long   type       = PositionGetInteger(POSITION_TYPE);\n   double profit     = PositionGetDouble(POSITION_PROFIT);\n   \n   double atr = GetATR();\n   if(atr <= 0) return;\n   \n   double currentPrice = (type == POSITION_TYPE_BUY) ? \n                         SymbolInfoDouble(TradeSymbol, SYMBOL_BID) : \n                         SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);\n   \n   // Calculate R (risk distance)\n   double riskDistance = MathAbs(openPrice - currentSL);\n   if(riskDistance <= 0) riskDistance = atr * ATR_Multiplier; // fallback\n   \n   double currentRR = 0;\n   if(type == POSITION_TYPE_BUY)\n      currentRR = (currentPrice - openPrice) / riskDistance;\n   else\n      currentRR = (openPrice - currentPrice) / riskDistance;\n   \n   //--- 1. Move to Breakeven\n   if(currentRR >= Breakeven_RR)\n   {\n      double newSL = openPrice;\n      \n      // Small buffer to cover spread\n      if(type == POSITION_TYPE_BUY)\n         newSL = openPrice + (5 * PointValue);\n      else\n         newSL = openPrice - (5 * PointValue);\n      \n      // Only move if better than current SL\n      bool improve = false;\n      if(type == POSITION_TYPE_BUY && (currentSL < newSL || currentSL == 0))\n         improve = true;\n      if(type == POSITION_TYPE_SELL && (currentSL > newSL || currentSL == 0))\n         improve = true;\n      \n      if(improve)\n      {\n         if(trade.PositionModify(PositionGetInteger(POSITION_TICKET), newSL, 0))\n            Print("Moved to BREAKEVEN | New SL: ", newSL);\n      }\n   }\n   \n   //--- 2. Trailing Stop (after BE level)\n   if(currentRR >= Trail_Start_RR)\n   {\n      double trailDistance = atr * Trail_ATR_Mult;\n      double newTrailSL;\n      \n      if(type == POSITION_TYPE_BUY)\n      {\n         newTrailSL = currentPrice - trailDistance;\n         if(newTrailSL > currentSL && newTrailSL > openPrice)\n         {\n            if(trade.PositionModify(PositionGetInteger(POSITION_TICKET), newTrailSL, 0))\n               Print("Trailing BUY SL → ", newTrailSL);\n         }\n      }\n      else // SELL\n      {\n         newTrailSL = currentPrice + trailDistance;\n         if((newTrailSL < currentSL || currentSL == 0) && newTrailSL < openPrice)\n         {\n            if(trade.PositionModify(PositionGetInteger(POSITION_TICKET), newTrailSL, 0))\n               Print("Trailing SELL SL → ", newTrailSL);\n         }\n      }\n   }\n}\n\n//+------------------------------------------------------------------+\n//| Helper: Get current ATR                                          |\n//+------------------------------------------------------------------+\ndouble GetATR()\n{\n   double atr[];\n   ArraySetAsSeries(atr, true);\n   int handle = iATR(TradeSymbol, PERIOD_CURRENT, ATR_Period);\n   if(CopyBuffer(handle, 0, 0, 2, atr) < 2) return 0;\n   return atr[0];\n}\n\n//+------------------------------------------------------------------+\n//| Helper: Check if we already have a position with our magic       |\n//+------------------------------------------------------------------+\nbool PositionSelectByMagic(string sym, int magic)\n{\n   for(int i = PositionsTotal() - 1; i >= 0; i--)\n   {\n      if(PositionGetSymbol(i) == sym && PositionGetInteger(POSITION_MAGIC) == magic)\n      {\n         return PositionSelectByTicket(PositionGetInteger(POSITION_TICKET));\n      }\n   }\n   return false;\n}\n//+------------------------------------------------------------------+\n
+//+------------------------------------------------------------------+
+//|                                      XAUUSD_Micro_Gold_EA.mq5    |
+//|                        Fixed $ Risk + Breakeven + Trailing       |
+//|                        Designed for Deriv XAUUSDmicro            |
+//+------------------------------------------------------------------+
+#property copyright "Dave-4u / Gold Micro EA"
+#property link      "https://github.com/Dave-4u/XAUUSD-Micro-Gold-EA-Deriv-v1"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//--- INPUTS
+input group "=== Risk Management ==="
+input double   RiskAmount          = 1.50;    // Dollars to risk per trade ($1 - $2)
+input int      MagicNumber         = 20261119;// Magic Number
+
+input group "=== Symbol ==="
+input string   SymbolOverride      = "XAUUSDmicro"; // Leave as XAUUSDmicro or change to XAUUSD later
+
+input group "=== Stop & Trailing ==="
+input int      ATR_Period          = 14;      // ATR Period
+input double   ATR_Multiplier      = 1.8;     // Initial Stop = ATR * this
+input double   Breakeven_RR        = 1.0;     // Move to Breakeven at this R multiple
+input double   Trail_ATR_Mult      = 1.5;     // Trailing Stop = ATR * this
+input int      Trail_Start_RR      = 1;       // Start trailing after this R (usually same as BE)
+
+input group "=== Strategy Filters ==="
+input int      EMA_Fast            = 21;      // Fast EMA (H4 bias)
+input int      EMA_Slow            = 50;      // Slow EMA (H4 bias)
+input int      Max_Spread_Points   = 50;      // Max allowed spread (points)
+
+//--- Global
+string         TradeSymbol;
+double         PointValue;
+int            DigitsValue;
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   TradeSymbol = (SymbolOverride == "") ? _Symbol : SymbolOverride;
+   
+   if(!SymbolSelect(TradeSymbol, true))
+   {
+      Print("ERROR: Symbol ", TradeSymbol, " not found. Check market watch.");
+      return(INIT_FAILED);
+   }
+   
+   PointValue  = SymbolInfoDouble(TradeSymbol, SYMBOL_POINT);
+   DigitsValue = (int)SymbolInfoInteger(TradeSymbol, SYMBOL_DIGITS);
+   
+   trade.SetExpertMagicNumber(MagicNumber);
+   trade.SetDeviationInPoints(20);
+   trade.SetTypeFilling(ORDER_FILLING_IOC);
+   
+   Print("XAUUSD Micro Gold EA initialized on ", TradeSymbol, " | Risk: $", RiskAmount);
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   Print("EA removed. Reason: ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   //--- Manage existing position first (BE + Trailing)
+   ManageOpenPosition();
+   
+   //--- Only one position at a time
+   if(PositionSelectByMagic(TradeSymbol, MagicNumber))
+      return;
+   
+   //--- Check spread
+   double spread = SymbolInfoInteger(TradeSymbol, SYMBOL_SPREAD) * PointValue;
+   if(spread > Max_Spread_Points * PointValue)
+      return;
+   
+   //--- Get trend bias from H4
+   int trend = GetH4Trend();
+   if(trend == 0) return;   // No clear trend
+   
+   //--- Look for entry
+   if(trend == 1)
+      CheckBuyEntry();
+   else if(trend == -1)
+      CheckSellEntry();
+}
+
+//+------------------------------------------------------------------+
+//| H4 Trend Filter (EMA Fast vs Slow)                               |
+//+------------------------------------------------------------------+
+int GetH4Trend()
+{
+   double emaFast[], emaSlow[];
+   ArraySetAsSeries(emaFast, true);
+   ArraySetAsSeries(emaSlow, true);
+   
+   int h4 = iEMA(TradeSymbol, PERIOD_H4, EMA_Fast, PRICE_CLOSE);
+   int h4s = iEMA(TradeSymbol, PERIOD_H4, EMA_Slow, PRICE_CLOSE);
+   
+   if(CopyBuffer(h4, 0, 0, 3, emaFast) < 3) return 0;
+   if(CopyBuffer(h4s, 0, 0, 3, emaSlow) < 3) return 0;
+   
+   if(emaFast[0] > emaSlow[0] && emaFast[1] > emaSlow[1])
+      return 1;   // Bullish
+   if(emaFast[0] < emaSlow[0] && emaFast[1] < emaSlow[1])
+      return -1;  // Bearish
+   
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Calculate Lot Size based on fixed dollar risk                    |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double stopDistancePrice)
+{
+   if(stopDistancePrice <= 0) return 0.0;
+   
+   double tickValue = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize  = SymbolInfoDouble(TradeSymbol, SYMBOL_TRADE_TICK_SIZE);
+   double minLot    = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MIN);
+   double maxLot    = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_MAX);
+   double lotStep   = SymbolInfoDouble(TradeSymbol, SYMBOL_VOLUME_STEP);
+   
+   if(tickValue == 0 || tickSize == 0) return 0.0;
+   
+   // Money risked per 1.0 lot for this stop distance
+   double moneyPerLot = (stopDistancePrice / tickSize) * tickValue;
+   
+   if(moneyPerLot <= 0) return 0.0;
+   
+   double lots = RiskAmount / moneyPerLot;
+   
+   // Normalize to lot step
+   lots = MathFloor(lots / lotStep) * lotStep;
+   
+   if(lots < minLot) lots = minLot;
+   if(lots > maxLot) lots = maxLot;
+   
+   return NormalizeDouble(lots, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Buy Entry Logic                                                  |
+//+------------------------------------------------------------------+
+void CheckBuyEntry()
+{
+   // Simple pullback + momentum filter on current timeframe
+   double atr = GetATR();
+   if(atr <= 0) return;
+   
+   double ask = SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
+   double stopLoss = ask - (atr * ATR_Multiplier);
+   double stopDistance = ask - stopLoss;
+   
+   double lots = CalculateLotSize(stopDistance);
+   if(lots <= 0) return;
+   
+   // Basic confirmation: price above fast EMA on current TF
+   double ema[];
+   ArraySetAsSeries(ema, true);
+   int handle = iEMA(TradeSymbol, PERIOD_CURRENT, 21, PRICE_CLOSE);
+   if(CopyBuffer(handle, 0, 0, 2, ema) < 2) return;
+   
+   if(ask > ema[0])
+   {
+      double takeProfit = 0; // We manage with trailing, no fixed TP
+      
+      if(trade.Buy(lots, TradeSymbol, ask, stopLoss, takeProfit, "Gold Micro Buy"))
+      {
+         Print("BUY opened | Lots: ", lots, " | SL: ", stopLoss, " | Risk: $", RiskAmount);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Sell Entry Logic                                                 |
+//+------------------------------------------------------------------+
+void CheckSellEntry()
+{
+   double atr = GetATR();
+   if(atr <= 0) return;
+   
+   double bid = SymbolInfoDouble(TradeSymbol, SYMBOL_BID);
+   double stopLoss = bid + (atr * ATR_Multiplier);
+   double stopDistance = stopLoss - bid;
+   
+   double lots = CalculateLotSize(stopDistance);
+   if(lots <= 0) return;
+   
+   double ema[];
+   ArraySetAsSeries(ema, true);
+   int handle = iEMA(TradeSymbol, PERIOD_CURRENT, 21, PRICE_CLOSE);
+   if(CopyBuffer(handle, 0, 0, 2, ema) < 2) return;
+   
+   if(bid < ema[0])
+   {
+      double takeProfit = 0;
+      
+      if(trade.Sell(lots, TradeSymbol, bid, stopLoss, takeProfit, "Gold Micro Sell"))
+      {
+         Print("SELL opened | Lots: ", lots, " | SL: ", stopLoss, " | Risk: $", RiskAmount);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage Open Position - Breakeven + Trailing                      |
+//+------------------------------------------------------------------+
+void ManageOpenPosition()
+{
+   if(!PositionSelectByMagic(TradeSymbol, MagicNumber))
+      return;
+   
+   double openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+   double currentSL  = PositionGetDouble(POSITION_SL);
+   double volume     = PositionGetDouble(POSITION_VOLUME);
+   long   type       = PositionGetInteger(POSITION_TYPE);
+   double profit     = PositionGetDouble(POSITION_PROFIT);
+   
+   double atr = GetATR();
+   if(atr <= 0) return;
+   
+   double currentPrice = (type == POSITION_TYPE_BUY) ? 
+                         SymbolInfoDouble(TradeSymbol, SYMBOL_BID) : 
+                         SymbolInfoDouble(TradeSymbol, SYMBOL_ASK);
+   
+   // Calculate R (risk distance)
+   double riskDistance = MathAbs(openPrice - currentSL);
+   if(riskDistance <= 0) riskDistance = atr * ATR_Multiplier; // fallback
+   
+   double currentRR = 0;
+   if(type == POSITION_TYPE_BUY)
+      currentRR = (currentPrice - openPrice) / riskDistance;
+   else
+      currentRR = (openPrice - currentPrice) / riskDistance;
+   
+   //--- 1. Move to Breakeven
+   if(currentRR >= Breakeven_RR)
+   {
+      double newSL = openPrice;
+      
+      // Small buffer to cover spread
+      if(type == POSITION_TYPE_BUY)
+         newSL = openPrice + (5 * PointValue);
+      else
+         newSL = openPrice - (5 * PointValue);
+      
+      // Only move if better than current SL
+      bool improve = false;
+      if(type == POSITION_TYPE_BUY && (currentSL < newSL || currentSL == 0))
+         improve = true;
+      if(type == POSITION_TYPE_SELL && (currentSL > newSL || currentSL == 0))
+         improve = true;
+      
+      if(improve)
+      {
+         if(trade.PositionModify(PositionGetInteger(POSITION_TICKET), newSL, 0))
+            Print("Moved to BREAKEVEN | New SL: ", newSL);
+      }
+   }
+   
+   //--- 2. Trailing Stop (after BE level)
+   if(currentRR >= Trail_Start_RR)
+   {
+      double trailDistance = atr * Trail_ATR_Mult;
+      double newTrailSL;
+      
+      if(type == POSITION_TYPE_BUY)
+      {
+         newTrailSL = currentPrice - trailDistance;
+         if(newTrailSL > currentSL && newTrailSL > openPrice)
+         {
+            if(trade.PositionModify(PositionGetInteger(POSITION_TICKET), newTrailSL, 0))
+               Print("Trailing BUY SL → ", newTrailSL);
+         }
+      }
+      else // SELL
+      {
+         newTrailSL = currentPrice + trailDistance;
+         if((newTrailSL < currentSL || currentSL == 0) && newTrailSL < openPrice)
+         {
+            if(trade.PositionModify(PositionGetInteger(POSITION_TICKET), newTrailSL, 0))
+               Print("Trailing SELL SL → ", newTrailSL);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Get current ATR                                          |
+//+------------------------------------------------------------------+
+double GetATR()
+{
+   double atr[];
+   ArraySetAsSeries(atr, true);
+   int handle = iATR(TradeSymbol, PERIOD_CURRENT, ATR_Period);
+   if(CopyBuffer(handle, 0, 0, 2, atr) < 2) return 0;
+   return atr[0];
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Check if we already have a position with our magic       |
+//+------------------------------------------------------------------+
+bool PositionSelectByMagic(string sym, int magic)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(PositionGetSymbol(i) == sym && PositionGetInteger(POSITION_MAGIC) == magic)
+      {
+         return PositionSelectByTicket(PositionGetInteger(POSITION_TICKET));
+      }
+   }
+   return false;
+}
+//+------------------------------------------------------------------+
